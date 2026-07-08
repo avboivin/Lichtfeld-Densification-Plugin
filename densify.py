@@ -26,30 +26,6 @@ from .core.selection import nearest_neighbors, select_cameras_by_visibility, sel
 from .core.writers import write_ply, write_points3D_bin, write_sparse_model_bin
 
 
-def _voxel_downsample(
-    xyz: np.ndarray, rgb: np.ndarray, voxel_size: float
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Downsample points so they are roughly *voxel_size* apart.
-
-    Uses Open3D voxel grid downsampling which averages points
-    falling in the same voxel, producing a uniform distribution.
-    """
-    import open3d as o3d
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
-    if rgb.max() > 1.0:
-        pcd.colors = o3d.utility.Vector3dVector(rgb[:, :3].astype(np.float64) / 255.0)
-    else:
-        pcd.colors = o3d.utility.Vector3dVector(rgb[:, :3].astype(np.float64))
-
-    down = pcd.voxel_down_sample(voxel_size=float(voxel_size))
-
-    out_xyz = np.asarray(down.points, dtype=np.float32)
-    out_rgb = np.asarray(down.colors, dtype=np.float32)  # [0, 1]
-    return out_xyz, out_rgb
-
-
 def _voxel_select_track_preserving(
     xyz: np.ndarray,
     rgb: np.ndarray,
@@ -142,8 +118,9 @@ def _apply_point_cap(
     max_points: int,
     seed: int,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[List[List[Tuple[int, float, float]]]]]:
+    del seed  # kept for API compatibility; cap is quality-ranked, not random
     if max_points > 0 and xyz.shape[0] > max_points:
-        sel = np.random.default_rng(seed).choice(xyz.shape[0], size=max_points, replace=False)
+        sel = np.argsort(err, kind="stable")[:max_points]
         capped_tracks = None if tracks is None else [list(tracks[i]) for i in sel]
         return xyz[sel], rgb[sel], err[sel], capped_tracks
     return xyz, rgb, err, None if tracks is None else [list(t) for t in tracks]
@@ -254,6 +231,7 @@ def dense_init(
         max_points=args.max_points,
         min_track_length=args.min_track_length,
         no_filter=args.no_filter,
+        voxel_size=getattr(args, "voxel_size", 0.0),
         seed=args.seed,
         viz_interval=0,
         prefetch_packages=args.prefetch_packages,
@@ -296,10 +274,24 @@ def dense_init(
     if xyz.shape[0] == 0:
         raise RuntimeError("No points remain after track-length filtering.")
     xyz, rgb, err, tracks = _apply_point_cap(xyz, rgb, err, tracks, args.max_points, args.seed)
+
+    voxel_size = float(getattr(args, "voxel_size", 0.0))
+    if voxel_size > 0.0 and tracks is not None:
+        xyz, rgb, err, tracks = _voxel_select_track_preserving(xyz, rgb, err, tracks, voxel_size)
+        lf.log.info(f"Distance filter ({voxel_size:.4f}): {xyz.shape[0]:,} points remaining")
+
     if progress_callback:
         progress_callback(95.0, "Writing output...")
-    _write_output(config.output_path, xyz, rgb, err)
-    lf.log.info(f"Dense reconstruction finished: {xyz.shape[0]:,} points -> {config.output_path}")
+    out_format = getattr(args, "out_format", "ply")
+    if out_format == "colmap":
+        if tracks is None:
+            raise RuntimeError("COLMAP output requires track data from the pipeline.")
+        out_dir = os.path.join(sparse_dir, args.out_name)
+        write_sparse_model_bin(out_dir, records, xyz, to_uint8_rgb(rgb), err, tracks)
+        lf.log.info(f"Dense reconstruction finished: {xyz.shape[0]:,} points -> {out_dir}")
+    else:
+        _write_output(config.output_path, xyz, rgb, err)
+        lf.log.info(f"Dense reconstruction finished: {xyz.shape[0]:,} points -> {config.output_path}")
     if progress_callback:
         progress_callback(100.0, f"Done! {xyz.shape[0]:,} points")
     return 0
@@ -435,7 +427,14 @@ def build_argparser():
         "--out_name",
         type=str,
         default="points3D_dense.ply",
-        help="Output filename under sparse/0/",
+        help="Output filename under sparse/0/ (ply) or subdirectory name (colmap)",
+    )
+    ap.add_argument(
+        "--out_format",
+        type=str,
+        default="ply",
+        choices=["ply", "colmap"],
+        help="Output format: ply (single file) or colmap (sparse model with tracks)",
     )
     ap.add_argument(
         "--roma_setting",
@@ -523,6 +522,12 @@ def build_argparser():
         help="Number of threads used to pack reference packages",
     )
     ap.add_argument("--seed", type=int, default=0, help="Random seed")
+    ap.add_argument(
+        "--voxel_size",
+        type=float,
+        default=0.0,
+        help="Track-preserving voxel spacing in scene units after cap (0=off)",
+    )
     return ap
 
 
